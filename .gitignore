@@ -1,0 +1,25 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Generated retrieval artifacts — rebuild with backend/ingest.py
+# (FAISS index, metadata, BM25 index: ~220 MB)
+backend/index/
+data/
+
+# Logs
+*.log
+
+# Local tooling / OS
+.claude/settings.local.json
+.DS_Store
+.idea/
+.vscode/
