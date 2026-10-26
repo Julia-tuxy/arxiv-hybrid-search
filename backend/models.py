@@ -12,6 +12,7 @@ class PaperResult(BaseModel):
     score: float
     vector_score: float
     bm25_score: float
+    retrieved_by: str = "both"   # which arm(s) returned this document
 
 
 class SearchResponse(BaseModel):

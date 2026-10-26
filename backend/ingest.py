@@ -3,12 +3,15 @@ One-time ingestion pipeline:
   1. Reservoir-sample TARGET papers from the arXiv JSONL snapshot
   2. Batch-encode title+abstract with Sentence-BERT
   3. Build a FAISS IndexFlatIP and save to index/
-  4. Save metadata as Parquet and BM25 tokenized corpus as pickle
+  4. Save metadata as Parquet and build the corpus-wide sparse BM25 index
+
+Step 4 used to pickle the tokenised corpus (140 MB) so that BM25 could be
+re-fitted per request. It now builds a SparseBM25 index (35 MB) that BM25 can
+actually retrieve from -- see eval/README.md for why that mattered.
 """
 
 import json
 import os
-import pickle
 import random
 import sys
 
@@ -17,6 +20,9 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+
+from bm25_index import SparseBM25
+from tokenizer import standard_tokens
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "arxiv-metadata-oai-snapshot.json")
 INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
@@ -103,7 +109,7 @@ def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
     return index
 
 
-def save_artifacts(index: faiss.Index, meta: list[dict], texts: list[str]) -> None:
+def save_artifacts(index: faiss.Index, meta: list[dict]) -> None:
     os.makedirs(INDEX_DIR, exist_ok=True)
 
     faiss.write_index(index, os.path.join(INDEX_DIR, "faiss_index.bin"))
@@ -113,10 +119,12 @@ def save_artifacts(index: faiss.Index, meta: list[dict], texts: list[str]) -> No
     df.to_parquet(os.path.join(INDEX_DIR, "metadata.parquet"), index=False)
     print(f"Saved metadata ({len(df)} rows)")
 
-    corpus_tokens = [t.lower().split() for t in texts]
-    with open(os.path.join(INDEX_DIR, "bm25_corpus.pkl"), "wb") as f:
-        pickle.dump(corpus_tokens, f)
-    print("Saved BM25 corpus")
+    # BM25 indexes the same fields as the dense arm, but without the [TITLE] /
+    # [ABSTRACT] markers: they occur in every document, so they carry no IDF.
+    corpus = [standard_tokens(f"{m['title']} {m['abstract']}") for m in meta]
+    bm25 = SparseBM25.build(corpus)
+    bm25.save(os.path.join(INDEX_DIR, "bm25_standard"))
+    print(f"Saved BM25 index (vocab {len(bm25.vocab):,}, nnz {bm25.W.nnz:,})")
 
 
 def main():
@@ -130,7 +138,7 @@ def main():
     embeddings = encode_texts(texts, model)
 
     index = build_faiss_index(embeddings)
-    save_artifacts(index, meta, texts)
+    save_artifacts(index, meta)
     print("Ingestion complete.")
 
 

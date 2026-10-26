@@ -1,0 +1,12 @@
+# evaluation-only dependencies (the API's own deps are in ../requirements.txt)
+numpy
+scipy
+pandas
+pyarrow
+faiss-cpu
+transformers
+torch
+matplotlib
+rank_bm25          # only to reproduce the legacy hybrid baseline
+sentence-transformers  # only for the cross-encoder reranking stage
+pytest

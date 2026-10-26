@@ -40,7 +40,7 @@ export default function App() {
         ArXiv Semantic Search
       </h1>
       <p style={{ margin: "0 0 28px", color: "#64748b", fontSize: "15px" }}>
-        Searching ~100K academic papers · SBERT dense retrieval + BM25 re-ranking
+        Searching ~100K academic papers · SBERT dense retrieval + BM25, fused
       </p>
 
       <SearchBar onSearch={handleSearch} isLoading={isLoading} />

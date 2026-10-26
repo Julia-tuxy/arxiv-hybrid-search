@@ -1,71 +1,98 @@
-"""
-Loads all index artifacts once at module import, exposes hybrid_search().
+"""Hybrid retrieval: dense and BM25 retrieve independently, then scores are fused.
+
+This is the configuration selected by the ablation in eval/ (see eval/README.md).
+Two properties matter and are easy to lose in a refactor:
+
+1. Both arms retrieve over the **whole corpus**. The earlier version pulled 100
+   candidates from FAISS and re-fitted BM25 on just those, which estimated IDF
+   from a 100-document sample and made a lexically-matching document that the
+   embedding missed unreachable at any weight.
+2. Each arm's scores are min-max normalised **over its own returned list**, then
+   blended. Keep it that way: the measured numbers come from exactly this
+   normalisation, so changing it invalidates them.
+
+ALPHA defaults to 0.5, the sweep optimum for short keyword queries (the shape
+real users type). Raise it toward 0.6 if traffic skews to long natural-language
+queries; lower it toward 0.2 for title-shaped, copy-pasted queries.
 """
 
+from __future__ import annotations
+
 import os
-import pickle
 
 import faiss
 import numpy as np
 import pandas as pd
-from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
-INDEX_DIR = os.path.join(os.path.dirname(__file__), "index")
-MODEL_NAME = "all-MiniLM-L6-v2"
-ALPHA = 0.7  # weight for vector similarity vs BM25
+from bm25_index import SparseBM25
+from fusion import arms_that_found, minmax_normalise, weighted_fusion
+from tokenizer import standard_tokens
+
+INDEX_DIR = os.environ.get(
+    "INDEX_DIR", os.path.join(os.path.dirname(__file__), "index")
+)
+MODEL_NAME = os.environ.get("MODEL_NAME", "all-MiniLM-L6-v2")
+ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.5"))
+K_EACH = int(os.environ.get("CANDIDATES_PER_ARM", "100"))
 
 print("Loading search artifacts…")
 _model = SentenceTransformer(MODEL_NAME)
 _index = faiss.read_index(os.path.join(INDEX_DIR, "faiss_index.bin"))
 _meta = pd.read_parquet(os.path.join(INDEX_DIR, "metadata.parquet"))
-with open(os.path.join(INDEX_DIR, "bm25_corpus.pkl"), "rb") as _f:
-    _corpus_tokens: list[list[str]] = pickle.load(_f)
-print(f"Loaded index with {_index.ntotal} vectors, {len(_meta)} metadata rows.")
+_bm25 = SparseBM25.load(os.path.join(INDEX_DIR, "bm25_standard"))
+print(
+    f"Loaded {_index.ntotal:,} vectors, {len(_meta):,} metadata rows, "
+    f"BM25 vocab {len(_bm25.vocab):,} (alpha={ALPHA}, k_each={K_EACH})"
+)
 
 
-def hybrid_search(query: str, top_k: int = 10, faiss_k: int = 100) -> list[dict]:
-    # 1. Encode query
-    q_vec = _model.encode(
+def _dense_arm(query: str, k: int) -> list[tuple[int, float]]:
+    vec = _model.encode(
         [query], normalize_embeddings=True, convert_to_numpy=True
     ).astype(np.float32)
+    scores, ids = _index.search(vec, min(k, _index.ntotal))
+    return list(zip(ids[0].tolist(), scores[0].tolist()))
 
-    # 2. FAISS retrieval
-    actual_k = min(faiss_k, _index.ntotal)
-    scores, indices = _index.search(q_vec, actual_k)
-    vector_scores = scores[0]   # cosine similarities in [-1, 1]
-    candidate_ids = indices[0]  # indices into metadata / corpus
 
-    # 3. BM25 re-ranking over candidates only
-    query_tokens = query.lower().split()
-    candidate_corpus = [_corpus_tokens[i] for i in candidate_ids]
-    bm25_local = BM25Okapi(candidate_corpus)
-    bm25_raw = np.array(bm25_local.get_scores(query_tokens), dtype=np.float32)
+def _sparse_arm(query: str, k: int) -> list[tuple[int, float]]:
+    ids, scores = _bm25.search(standard_tokens(query), k)
+    # Zero-scoring documents are kept on purpose: dropping them would shift the
+    # min-max floor and change every normalised score, so the served ranking
+    # would no longer be the one the ablation measured.
+    return [(int(i), float(s)) for i, s in zip(ids, scores)]
 
-    # 4. Normalize both scores to [0, 1]
-    vector_norm = (vector_scores + 1.0) / 2.0
-    bm25_max = bm25_raw.max() if bm25_raw.max() > 0 else 1.0
-    bm25_norm = bm25_raw / bm25_max
 
-    # 5. Combine
-    hybrid_scores = ALPHA * vector_norm + (1.0 - ALPHA) * bm25_norm
+def hybrid_search(
+    query: str,
+    top_k: int = 10,
+    alpha: float | None = None,
+    k_each: int | None = None,
+) -> list[dict]:
+    alpha = ALPHA if alpha is None else alpha
+    k_each = K_EACH if k_each is None else k_each
 
-    # 6. Sort and return top_k
-    ranked_order = np.argsort(-hybrid_scores)[:top_k]
+    dense_hits = _dense_arm(query, k_each)
+    sparse_hits = _sparse_arm(query, k_each)
+    dense = minmax_normalise(dense_hits)
+    sparse = minmax_normalise(sparse_hits)
+    fused = weighted_fusion(dense_hits, sparse_hits, alpha)
 
     results = []
-    for pos in ranked_order:
-        idx = int(candidate_ids[pos])
-        row = _meta.iloc[idx]
-        results.append({
-            "arxiv_id":         str(row["arxiv_id"]),
-            "title":            str(row["title"]),
-            "abstract_snippet": str(row["abstract"])[:300],
-            "authors":          str(row["authors"]),
-            "year":             str(row["year"]),
-            "categories":       str(row["categories"]),
-            "score":            float(hybrid_scores[pos]),
-            "vector_score":     float(vector_norm[pos]),
-            "bm25_score":       float(bm25_norm[pos]),
-        })
+    for doc, score, d, s in fused[:top_k]:
+        row = _meta.iloc[doc]
+        results.append(
+            {
+                "arxiv_id": str(row["arxiv_id"]),
+                "title": str(row["title"]),
+                "abstract_snippet": str(row["abstract"])[:300],
+                "authors": str(row["authors"]),
+                "year": str(row["year"]),
+                "categories": str(row["categories"]),
+                "score": float(score),
+                "vector_score": float(d),
+                "bm25_score": float(s),
+                "retrieved_by": arms_that_found(doc, dense, sparse),
+            }
+        )
     return results
