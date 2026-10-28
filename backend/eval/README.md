@@ -121,10 +121,16 @@ precomputed at build time and a query becomes a sum of sparse columns
 | Corpus-wide BM25 query | not possible (candidates only) | 0.2 ms p50 |
 | Build time (100K docs) | — | ~20 s |
 
-Retrieval latency is dominated by query *encoding*, not search: the dense arm is
-36.3 ms p50 while corpus-wide BM25 costs 0.24 ms — about 150× cheaper — so
-adding a proper BM25 arm is free relative to the embedding forward pass. Fused
-search is not slower than dense-only search.
+Breaking the dense arm into its two costs (360 interleaved measurements, same
+machine): query encoding **12.9 ms p50**, exact FAISS search over the 100K
+vectors **17.5 ms p50**. Brute-force search is 58 % of the dense arm — and it is
+the half that grows linearly with corpus size, while encoding does not. Against
+that, corpus-wide BM25 at 0.6 ms is essentially free, so fused search is not
+slower than dense-only search.
+
+(An earlier revision of this file claimed latency was dominated by encoding.
+That was wrong: it was inferred from the arm's end-to-end number without
+measuring the two components separately.)
 
 ## 3. What ships in the API
 

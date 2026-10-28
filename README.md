@@ -39,9 +39,9 @@ Three things the ablation established:
    0.2 / 0.6 / 0.5 for title / paraphrased / keyword queries respectively.
 
 BM25 was also rebuilt as a precomputed sparse weight matrix: the index went from
-a 140 MB pickle to 35 MB, and corpus-wide lexical retrieval costs 0.2 ms p50
-against 36 ms for the dense arm's query encoding — so the second arm is
-effectively free.
+a 140 MB pickle to 35 MB, and corpus-wide lexical retrieval costs 0.6 ms p50
+against ~30 ms for the dense arm (12.9 ms query encoding + 17.5 ms exact FAISS
+search) — so the second arm is effectively free.
 
 ## Architecture
 
@@ -122,9 +122,10 @@ nDCG@10, latency percentiles and paired-bootstrap significance.
 * Evaluation is **single-positive known-item retrieval**: absolute scores are
   optimistic and are not comparable to BEIR numbers. Only the relative
   comparison between systems is claimed.
-* The dense index is `IndexFlatIP` — exact brute-force search. It is fine at
-  100K documents and will not be at 2.7M; the HNSW / IVF-PQ recall-latency
-  trade-off is unmeasured.
+* The dense index is `IndexFlatIP` — exact brute-force search. It is already
+  58 % of dense-arm latency at 100K documents and scales linearly, so it will
+  not survive the full 2.7M corpus (which is also 4.1 GB of float32 vectors);
+  the HNSW / IVF-PQ recall-latency trade-off is unmeasured.
 * Cross-encoder reranking is implemented (`eval/retrievers.py`) but has not been
   run, so no second-stage numbers are claimed.
 * No metadata filtering (category, year) in the query path yet.
