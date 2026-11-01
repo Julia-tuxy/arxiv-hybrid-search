@@ -16,6 +16,7 @@ from bm25_index import SparseBM25
 from fusion import arms_that_found, minmax_normalise, weighted_fusion
 from metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 from run_eval import paired_bootstrap
+from run_rerank_eval import predict_in_length_order, rerank
 
 
 # ---------------------------------------------------------------- metrics
@@ -124,6 +125,32 @@ def test_arms_that_found():
     assert arms_that_found(1, d, s) == "dense"
     assert arms_that_found(2, d, s) == "both"
     assert arms_that_found(3, d, s) == "bm25"
+
+
+# ---------------------------------------------------------------- reranking
+def test_rerank_reorders_only_the_prefix():
+    cands = [10, 11, 12, 13, 14]
+    scores = [0.1, 0.9, 0.2, 0.8, 0.0]      # doc 11 is the cross-encoder's favourite
+    assert rerank(cands, scores, 3) == [11, 12, 10, 13, 14]   # tail keeps its order
+    assert rerank(cands, scores, 5) == [11, 13, 12, 10, 14]
+    assert rerank(cands, scores, 1) == cands                  # nothing to reorder
+    assert rerank(cands, scores, 99) == rerank(cands, scores, 5)  # depth past the end
+
+
+def test_rerank_is_a_permutation():
+    cands = list(range(20))
+    scores = list(np.random.default_rng(3).random(20))
+    for d in (1, 5, 20, 50):
+        assert sorted(rerank(cands, scores, d)) == cands
+
+
+def test_predict_in_length_order_restores_caller_order():
+    pairs = [("q", "d" * n) for n in (300, 5, 120, 7, 900)]
+    # a predictor whose output depends only on the pair it is given, so any
+    # reordering bug shows up as a mismatch
+    fake = lambda ps: [float(len(b)) for _, b in ps]
+    out = predict_in_length_order(fake, pairs)
+    assert list(out) == [float(len(b)) for _, b in pairs]
 
 
 # ---------------------------------------------------------------- statistics
