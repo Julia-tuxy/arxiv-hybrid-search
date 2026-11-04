@@ -36,14 +36,30 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "all-MiniLM-L6-v2")
 ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.5"))
 K_EACH = int(os.environ.get("CANDIDATES_PER_ARM", "100"))
 
+# Stage 2 is opt-in and OFF by default. It is worth +5.0 nDCG@10 on keyword
+# queries and costs 33 ms -> 601 ms p50 on a 2-vCPU CPU box (eval/README.md
+# section 3). Set RERANK_TOP_K=10 to enable; 10 is the measured optimum, deeper
+# reranking never helped because the first stage's Recall@10 is already 1.000.
+RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "0"))
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+
 print("Loading search artifacts…")
 _model = SentenceTransformer(MODEL_NAME)
 _index = faiss.read_index(os.path.join(INDEX_DIR, "faiss_index.bin"))
 _meta = pd.read_parquet(os.path.join(INDEX_DIR, "metadata.parquet"))
 _bm25 = SparseBM25.load(os.path.join(INDEX_DIR, "bm25_standard"))
+_reranker = None
+_rerank_texts: list[str] | None = None
+if RERANK_TOP_K > 0:
+    from sentence_transformers import CrossEncoder
+
+    _reranker = CrossEncoder(RERANK_MODEL, max_length=512)
+    _rerank_texts = (_meta.title + ". " + _meta.abstract).tolist()
+
 print(
     f"Loaded {_index.ntotal:,} vectors, {len(_meta):,} metadata rows, "
-    f"BM25 vocab {len(_bm25.vocab):,} (alpha={ALPHA}, k_each={K_EACH})"
+    f"BM25 vocab {len(_bm25.vocab):,} (alpha={ALPHA}, k_each={K_EACH}, "
+    f"rerank_top_k={RERANK_TOP_K})"
 )
 
 
@@ -68,6 +84,7 @@ def hybrid_search(
     top_k: int = 10,
     alpha: float | None = None,
     k_each: int | None = None,
+    rerank_top_k: int | None = None,
 ) -> list[dict]:
     alpha = ALPHA if alpha is None else alpha
     k_each = K_EACH if k_each is None else k_each
@@ -77,6 +94,16 @@ def hybrid_search(
     dense = minmax_normalise(dense_hits)
     sparse = minmax_normalise(sparse_hits)
     fused = weighted_fusion(dense_hits, sparse_hits, alpha)
+
+    rerank_k = RERANK_TOP_K if rerank_top_k is None else rerank_top_k
+    if rerank_k > 0 and _reranker is not None:
+        head = fused[:rerank_k]
+        ce = _reranker.predict([(query, _rerank_texts[doc]) for doc, *_ in head],
+                               show_progress_bar=False)
+        # keep the fused score for display; reorder by the cross-encoder, and
+        # leave the tail in first-stage order
+        head = [head[i] for i in np.argsort(-np.asarray(ce))]
+        fused = head + fused[rerank_k:]
 
     results = []
     for doc, score, d, s in fused[:top_k]:

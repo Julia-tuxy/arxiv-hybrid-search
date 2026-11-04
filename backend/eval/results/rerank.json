@@ -1,0 +1,163 @@
+{
+  "config": {
+    "first_stage": "weighted_fusion_alpha0.5",
+    "depth": 100,
+    "max_length": 512,
+    "batch_size": 32,
+    "device": "cpu",
+    "n_queries": {
+      "nl": 120,
+      "short": 120,
+      "title": 100
+    },
+    "latency_note": "end-to-end per query, single process, 2 vCPU, caches off; the added_ms_p50 fields are derived from bulk throughput and are superseded by these measured numbers",
+    "ce_model": "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  },
+  "first_stage": {
+    "nl": {
+      "recall@10": 1.0,
+      "recall@100": 1.0,
+      "mrr@10": 0.9281,
+      "ndcg@10": 0.9461
+    },
+    "short": {
+      "recall@10": 1.0,
+      "recall@100": 1.0,
+      "mrr@10": 0.9053,
+      "ndcg@10": 0.9285
+    },
+    "title": {
+      "recall@10": 1.0,
+      "recall@100": 1.0,
+      "mrr@10": 0.9789,
+      "ndcg@10": 0.9839
+    }
+  },
+  "rerank": {
+    "ms-marco-MiniLM-L-6-v2": {
+      "nl": {
+        "top10": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 0.9854,
+          "ndcg@10": 0.9891,
+          "p_vs_first_stage": 0.0025,
+          "added_ms_p50": 531.2
+        },
+        "top20": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 0.9847,
+          "ndcg@10": 0.9885,
+          "p_vs_first_stage": 0.0029,
+          "added_ms_p50": 1062.5
+        },
+        "top50": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 0.9833,
+          "ndcg@10": 0.9874,
+          "p_vs_first_stage": 0.0036,
+          "added_ms_p50": 2656.2
+        },
+        "top100": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 0.9833,
+          "ndcg@10": 0.9874,
+          "p_vs_first_stage": 0.0036,
+          "added_ms_p50": 5312.4
+        }
+      },
+      "short": {
+        "top10": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 0.9708,
+          "ndcg@10": 0.9785,
+          "p_vs_first_stage": 0.0014,
+          "added_ms_p50": 500.4
+        },
+        "top20": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 0.9708,
+          "ndcg@10": 0.9785,
+          "p_vs_first_stage": 0.0014,
+          "added_ms_p50": 1000.7
+        },
+        "top50": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 0.9667,
+          "ndcg@10": 0.9754,
+          "p_vs_first_stage": 0.0028,
+          "added_ms_p50": 2501.8
+        },
+        "top100": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 0.9667,
+          "ndcg@10": 0.9754,
+          "p_vs_first_stage": 0.0028,
+          "added_ms_p50": 5003.6
+        }
+      },
+      "title": {
+        "top10": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 1.0,
+          "ndcg@10": 1.0,
+          "p_vs_first_stage": 0.0611,
+          "added_ms_p50": 509.7
+        },
+        "top20": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 1.0,
+          "ndcg@10": 1.0,
+          "p_vs_first_stage": 0.0611,
+          "added_ms_p50": 1019.4
+        },
+        "top50": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 1.0,
+          "ndcg@10": 1.0,
+          "p_vs_first_stage": 0.0611,
+          "added_ms_p50": 2548.5
+        },
+        "top100": {
+          "recall@10": 1.0,
+          "recall@100": 1.0,
+          "mrr@10": 1.0,
+          "ndcg@10": 1.0,
+          "p_vs_first_stage": 0.0611,
+          "added_ms_p50": 5096.9
+        }
+      }
+    }
+  },
+  "throughput": {
+    "ms-marco-MiniLM-L-6-v2": {
+      "nl": 18.8,
+      "short": 20.0,
+      "title": 19.6
+    }
+  },
+  "measured_latency_p50_ms": {
+    "first_stage": 33.3,
+    "top10": 601.1,
+    "top20": 1315.6,
+    "top50": 2909.7,
+    "top100": 5469.4
+  },
+  "measured_latency_p95_ms": {
+    "first_stage": 38.0,
+    "top10": 1311.4,
+    "top20": 2552.3,
+    "top50": 3721.1,
+    "top100": 6347.4
+  }
+}

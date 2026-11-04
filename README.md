@@ -10,6 +10,7 @@ weight were selected by measurement, and the first thing that measurement found
 was a bug in the original architecture.
 
 ![fusion weight sweep](backend/eval/results/alpha_sweep.png)
+![quality vs latency frontier](backend/eval/results/rerank_frontier.png)
 
 ## Headline results
 
@@ -22,8 +23,12 @@ Known-item retrieval over the 100K-paper index, nDCG@10 by query type
 | Dense only (MiniLM + FAISS) | 0.949 | 0.919 | 0.860 |
 | Original hybrid (dense → BM25 rescoring, α=0.7) | 0.996 | 0.935 | 0.882 |
 | **Weighted score fusion, α=0.5** ← served | 0.991 | 0.946 | **0.928** |
+| + cross-encoder rerank of the top 10 (opt-in) | 1.000\* | 0.989\* | **0.978**\* |
 
-Three things the ablation established:
+\* Stage-2 rows are measured on 340 of the queries (the title set is
+subsampled); see [backend/eval/README.md](backend/eval/README.md) section 3.
+
+Four things the ablation established:
 
 1. **Neither arm wins alone.** BM25 beats dense by 4.6 nDCG points on
    title-shaped queries and loses by 4.0 on short keyword queries. The ranking
@@ -37,6 +42,12 @@ Three things the ablation established:
    result now comes from a document the dense arm never returned.
 3. **The hard-coded α = 0.7 was wrong for every query type.** The optimum is
    0.2 / 0.6 / 0.5 for title / paraphrased / keyword queries respectively.
+4. **A cross-encoder second stage is worth +5.0 nDCG@10 — and is still off by
+   default.** Reranking the top 10 takes keyword queries from 0.928 to 0.978
+   (p = 0.0014), but costs 33 ms → 601 ms p50 on a 2-vCPU box. Reranking deeper
+   than 10 never helped: the first stage's Recall@10 is already 1.000, so
+   candidates 11-100 contain nothing left to find, and the usual "rerank the
+   top 50" default would have cost 5× the latency for a slightly worse result.
 
 BM25 was also rebuilt as a precomputed sparse weight matrix: the index went from
 a 140 MB pickle to 35 MB, and corpus-wide lexical retrieval costs 0.6 ms p50
@@ -99,6 +110,8 @@ code change:
 |---|---|---|
 | `HYBRID_ALPHA` | `0.5` | weight on the dense arm (0 = BM25 only, 1 = dense only) |
 | `CANDIDATES_PER_ARM` | `100` | documents each arm contributes to the fusion |
+| `RERANK_TOP_K` | `0` | cross-encoder rerank depth; `0` disables stage 2, `10` is the measured optimum |
+| `RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | reranker, loaded only when `RERANK_TOP_K > 0` |
 | `MODEL_NAME` | `all-MiniLM-L6-v2` | sentence-transformers model |
 | `INDEX_DIR` | `backend/index` | where the artifacts live |
 
@@ -109,13 +122,15 @@ cd backend/eval
 pip install -r requirements-eval.txt
 python build_index.py                                  # BM25 indexes -> ../index/
 python build_queries.py --metadata ../index/metadata.parquet
-python run_eval.py                                     # -> results/ablation.json
-python -m pytest test_eval.py -q                       # 11 correctness tests
+python run_eval.py                                     # stage 1 -> results/ablation.json
+python run_rerank_eval.py                              # stage 2 -> results/rerank.json
+python -m pytest test_eval.py -q                       # 14 correctness tests
 ```
 
 The harness scores BM25, dense, the original hybrid, weighted fusion across an
-α sweep, and RRF, on three query sets, reporting Recall@10/@100, MRR@10,
-nDCG@10, latency percentiles and paired-bootstrap significance.
+α sweep, and RRF on three query sets, then sweeps cross-encoder rerank depth
+over the winning first stage — reporting Recall@10/@100, MRR@10, nDCG@10,
+latency percentiles and paired-bootstrap significance throughout.
 
 ## Known limitations
 
@@ -126,8 +141,10 @@ nDCG@10, latency percentiles and paired-bootstrap significance.
   58 % of dense-arm latency at 100K documents and scales linearly, so it will
   not survive the full 2.7M corpus (which is also 4.1 GB of float32 vectors);
   the HNSW / IVF-PQ recall-latency trade-off is unmeasured.
-* Cross-encoder reranking is implemented (`eval/retrievers.py`) but has not been
-  run, so no second-stage numbers are claimed.
+* The cross-encoder verdict is hardware-bound, not model-bound: at ~19 pairs/s
+  on two CPU cores the second stage is too slow to leave on; on a GPU or with a
+  quantised runtime the same gain would cost tens of milliseconds. Only
+  `ms-marco-MiniLM-L-6-v2` was measured.
 * No metadata filtering (category, year) in the query path yet.
 
 ## API

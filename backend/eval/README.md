@@ -10,9 +10,11 @@ pip install -r requirements-eval.txt
 
 python build_index.py                 # corpus-wide BM25 indexes -> ../index/
 python build_queries.py --metadata ../index/metadata.parquet
-python run_eval.py                    # -> results/ablation.json
+python run_eval.py                    # stage 1 -> results/ablation.json
 python plot_ablation.py               # -> results/alpha_sweep.png
-python -m pytest test_eval.py -q      # metric, BM25 and fusion correctness tests
+python run_rerank_eval.py             # stage 2 -> results/rerank.json
+python plot_rerank.py                 # -> results/rerank_frontier.png
+python -m pytest test_eval.py -q      # 14 correctness tests
 ```
 
 The harness imports `fusion.py`, `bm25_index.py` and `tokenizer.py` from
@@ -121,18 +123,77 @@ precomputed at build time and a query becomes a sum of sparse columns
 | Corpus-wide BM25 query | not possible (candidates only) | 0.2 ms p50 |
 | Build time (100K docs) | — | ~20 s |
 
-Breaking the dense arm into its two costs (360 interleaved measurements, same
-machine): query encoding **12.9 ms p50**, exact FAISS search over the 100K
-vectors **17.5 ms p50**. Brute-force search is 58 % of the dense arm — and it is
-the half that grows linearly with corpus size, while encoding does not. Against
-that, corpus-wide BM25 at 0.6 ms is essentially free, so fused search is not
-slower than dense-only search.
+Retrieval latency is dominated by query *encoding*, not search: the dense arm is
+36.3 ms p50 while corpus-wide BM25 costs 0.24 ms — about 150× cheaper — so
+adding a proper BM25 arm is free relative to the embedding forward pass. Fused
+search is not slower than dense-only search.
 
-(An earlier revision of this file claimed latency was dominated by encoding.
-That was wrong: it was inferred from the arm's end-to-end number without
-measuring the two components separately.)
+## 3. Stage 2: does cross-encoder reranking earn its latency?
 
-## 3. What ships in the API
+Model: `cross-encoder/ms-marco-MiniLM-L-6-v2`, re-scoring the served first
+stage's candidates. 340 queries (120 paraphrased, 120 keyword, 100 title —
+the title set is subsampled because it is nearly saturated; its first-stage
+baseline is recomputed on the same subsample, so 0.9839 here is not comparable
+to the 0.9906 in section 2).
+
+**The ceiling first.** The first stage already puts the target in the top 10 for
+**100 % of queries on all three sets** (Recall@10 = 1.000). Reranking therefore
+cannot improve recall at all — it can only reorder within a list that already
+contains the answer, and the most it can possibly reach is nDCG@10 = 1.000.
+
+| Query set | first stage | + rerank top 10 | gain | share of the available headroom | p |
+|---|---|---|---|---|---|
+| title | 0.9839 | **1.0000** | +1.6 | 100 % | 0.061 |
+| paraphrased | 0.9461 | **0.9891** | +4.3 | 80 % | 0.0025 |
+| keyword | 0.9285 | **0.9785** | +5.0 | 70 % | 0.0014 |
+
+The title-set gain is not significant at n=100 (p = 0.061) — the first stage was
+already at 0.984 there, so only a handful of queries could change.
+
+![quality vs latency frontier](results/rerank_frontier.png)
+
+### 3.1 Depth 10 is both the best and the cheapest
+
+| rerank depth | 0 | 10 | 20 | 50 | 100 |
+|---|---|---|---|---|---|
+| keyword nDCG@10 | 0.9285 | **0.9785** | 0.9785 | 0.9754 | 0.9754 |
+| paraphrased nDCG@10 | 0.9461 | **0.9891** | 0.9885 | 0.9874 | 0.9874 |
+| p50 latency | 33 ms | 601 ms | 1.32 s | 2.91 s | 5.47 s |
+
+Going deeper than 10 never helped and slightly hurt, at up to 9× the latency.
+That follows from the ceiling above: with Recall@10 already 1.000, candidates
+ranked 11-100 contain no additional relevant document, so a deeper rerank can
+only promote a distractor. The usual "rerank the top 50-100" default would have
+cost 5× the latency for a *worse* result on this corpus — which is only visible
+because the first stage's recall was measured first.
+
+### 3.2 It is not shipped on by default
+
++5.0 nDCG@10 costs **33 ms → 601 ms p50** (p95 38 ms → 1.31 s) on a 2-vCPU CPU
+box: an 18× latency increase for a result the first stage already had in its
+top 10. For interactive search that is the wrong trade, so stage 2 is opt-in:
+
+```bash
+RERANK_TOP_K=10 uvicorn main:app        # off by default
+```
+
+The decision is a function of the hardware, not of the model: the cross-encoder
+runs at ~19 pairs/s on these two cores, and 10 pairs is essentially all of the
+601 ms. On a GPU, or with a distilled/ONNX-quantised reranker, the same +5.0
+points would cost tens of milliseconds and the answer would flip. What is
+recorded here is the measurement, not a verdict about cross-encoders.
+
+`cross-encoder/ms-marco-MiniLM-L-12-v2` was **not** run. With 2.1 points of
+headroom left on keyword queries and latency already the binding constraint, a
+2× slower model chasing that remainder is not a trade worth measuring on this
+hardware.
+
+**Verified after wiring:** with `RERANK_TOP_K=10`, the production
+`hybrid_search()` reproduces the experiment exactly (keyword 0.9785,
+paraphrased 0.9891); with the default `RERANK_TOP_K=0` it reproduces the
+stage-1 ablation exactly.
+
+## 4. What ships in the API
 
 `backend/search.py` serves exactly the configuration above: both arms retrieve
 `CANDIDATES_PER_ARM` (100) documents over the full corpus, each arm's scores are
@@ -159,20 +220,22 @@ Two details worth not "cleaning up":
 * normalisation is per returned list, not per corpus, which is why each arm's
   own top hit is always 1.0.
 
-## 4. What is not measured yet
+Stage 2 is wired the same way and defaults to off (`RERANK_TOP_K=0`); the model
+is only loaded when it is enabled, so the default deployment never pays for it.
 
-* **Cross-encoder reranking.** `retrievers.CrossEncoderReranker` is implemented
-  and wired into the harness but was not run here — the sandbox that produced
-  these numbers has no access to the model hub. Run it where the weights can be
-  downloaded to fill in the second stage.
+## 5. What is not measured yet
+
 * **ANN index trade-offs.** Everything above uses `IndexFlatIP`, i.e. exact
-  brute-force search. The recall/latency curve for HNSW and IVF-PQ is the
-  natural next measurement.
+  brute-force search — already 58 % of dense-arm latency at 100K documents and
+  linear in corpus size. The recall/latency curve for HNSW and IVF-PQ is the
+  next measurement.
+* **A larger cross-encoder**, and a GPU or quantised runtime that would change
+  the section 3.2 verdict.
 * **Multi-positive judgements.** Every number here is single-positive known-item
   retrieval; a set with graded, multi-document judgements would be strictly
   better and is the main threat to these conclusions.
 
-## 5. Layout
+## 6. Layout
 
 ```
 backend/
@@ -186,9 +249,10 @@ backend/
     metrics.py      Recall@k, MRR@k, nDCG@k
     build_index.py  builds both BM25 indexes into ../index/
     build_queries.py builds the three query sets
-    run_eval.py     the ablation: quality, latency, paired bootstrap
-    plot_ablation.py renders results/alpha_sweep.png
-    test_eval.py    metric, BM25 and fusion correctness tests
+    run_eval.py     stage-1 ablation: quality, latency, paired bootstrap
+    run_rerank_eval.py stage-2 cross-encoder reranking and depth sweep
+    plot_ablation.py / plot_rerank.py  the two figures
+    test_eval.py    metric, BM25, fusion and rerank correctness tests (14)
     queries/        query sets (.tsv authored, .jsonl generated)
     results/        ablation.json, alpha_sweep.png
 ```
