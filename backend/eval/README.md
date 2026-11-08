@@ -14,7 +14,9 @@ python run_eval.py                    # stage 1 -> results/ablation.json
 python plot_ablation.py               # -> results/alpha_sweep.png
 python run_rerank_eval.py             # stage 2 -> results/rerank.json
 python plot_rerank.py                 # -> results/rerank_frontier.png
-python -m pytest test_eval.py -q      # 14 correctness tests
+python run_ann_bench.py               # vector index benchmark -> results/ann_bench.json
+python plot_ann.py                    # -> results/ann_frontier.png
+python -m pytest test_eval.py test_ann.py -q
 ```
 
 The harness imports `fusion.py`, `bm25_index.py` and `tokenizer.py` from
@@ -223,19 +225,129 @@ Two details worth not "cleaning up":
 Stage 2 is wired the same way and defaults to off (`RERANK_TOP_K=0`); the model
 is only loaded when it is enabled, so the default deployment never pays for it.
 
-## 5. What is not measured yet
+## 5. Vector index: exact vs approximate search
 
-* **ANN index trade-offs.** Everything above uses `IndexFlatIP`, i.e. exact
-  brute-force search — already 58 % of dense-arm latency at 100K documents and
-  linear in corpus size. The recall/latency curve for HNSW and IVF-PQ is the
-  next measurement.
+`run_ann_bench.py` compares FAISS **Flat** (exact), **IVF-Flat**, **IVF-PQ** and
+**HNSW** on the 100,000 stored MiniLM vectors, with all 740 evaluation queries
+encoded by the served model. Every row reports two kinds of quality:
+
+* **index recall@k**: how much of the exact top-k the index returns. This
+  measures the index on its own, with no relevance judgements involved;
+* **task nDCG@10**: known-item quality of the *served hybrid* (dense + BM25,
+  α = 0.5) when its dense arm uses this index. This is the number users see.
+
+Latency is single-query search with one FAISS thread (the per-core cost that
+matters under concurrent load), with query encoding excluded and 1,480 timed
+searches per row, on an Apple M1. Memory is the resident-set increase of a
+fresh process that loads only that index.
+
+```bash
+python run_ann_bench.py        # -> results/ann_bench.json   (~10 min)
+python plot_ann.py             # -> results/ann_frontier.png
+python -m pytest test_ann.py   # 10 index-layer tests
+```
+
+![ANN trade-off](results/ann_frontier.png)
+
+| Index | Setting | recall@10 | recall@100 | p50 | p95 | p99 | hybrid nDCG@10 title / para / keyword |
+|---|---|---|---|---|---|---|---|
+| **Flat** (exact) | — | 1.000 | 1.000 | 3.15 ms | 3.49 ms | 3.72 ms | **0.9906 / 0.9461 / 0.9285** |
+| HNSW M=32 | ef=64 | 0.985 | 0.925 | 0.21 ms | 0.34 ms | 0.47 ms | 0.9837 / 0.9450 / 0.9195 |
+| HNSW M=32 | ef=128 | 0.995 | 0.974 | 0.34 ms | 0.45 ms | 0.49 ms | 0.9867 / 0.9461 / 0.9227 |
+| **HNSW M=32** | **ef=256** | 0.999 | 0.992 | 0.63 ms | 0.82 ms | 0.90 ms | 0.9891 / 0.9461 / **0.9274** |
+| HNSW M=32 | ef=512 | 1.000 | 0.998 | 1.20 ms | 1.55 ms | 1.79 ms | 0.9899 / 0.9461 / **0.9285** |
+| IVF-Flat 1024 | nprobe=32 | 0.951 | 0.904 | 0.18 ms | 0.21 ms | 0.27 ms | 0.9769 / 0.9414 / 0.8912 |
+| IVF-Flat 1024 | nprobe=128 | 0.990 | 0.984 | 0.56 ms | 0.67 ms | 0.76 ms | 0.9874 / 0.9467 / 0.9182 |
+| IVF-PQ 48×8 | nprobe=128 | 0.650 | 0.681 | 0.28 ms | 0.32 ms | 0.38 ms | 0.9862 / 0.9396 / 0.8970 |
+
+The Flat row reproduces the section 2 ablation to four decimal places, so the
+benchmark measures the served pipeline and not a copy of it.
+
+| Index | Build (train + add) | On disk | Resident memory | Add throughput, 1k-vector batches | Delete |
+|---|---|---|---|---|---|
+| Flat | 0.03 s | 153.6 MB | 153.8 MB | 7.2 M vec/s | physical `remove_ids`; **renumbers later rows** |
+| IVF-Flat 1024 | 2.2 s + 0.2 s | 156.0 MB | 163.3 MB | 414 k vec/s | physical, ids stable, 0.4 ms / 1k ids |
+| IVF-PQ 48×8 | 4.1 s + 1.5 s | **7.6 MB** | **7.0 MB** | 64 k vec/s | physical, ids stable |
+| HNSW M=32 | 19.4 s | 180.8 MB | 180.4 MB | **3.3 k vec/s** | not supported: tombstone filter at query time |
+
+### 5.1 Tune for recall@100, not recall@10
+
+Fusion consumes the dense arm's **top 100**, not its top 10. An index can look
+almost perfect on recall@10 and still cost the hybrid noticeable quality:
+
+* IVF at nprobe=32 has recall@10 = 0.951 but loses **3.7 nDCG points** on
+  keyword queries (0.9285 → 0.8912), because its recall@100 is only 0.904;
+* HNSW at ef=128 has recall@10 = 0.995 and still loses 0.6 points, because
+  recall@100 is 0.974.
+
+Two things happen when the deep tail is wrong. A relevant document ranked 30-100
+by the dense arm, which fusion would have lifted using its BM25 score, never
+reaches fusion. And the dense arm's min-max floor (its 100th score) moves, which
+rescales every normalised dense score. The rule that follows: **efSearch / nprobe
+are set from recall@k_each**, and k_each is 100 here. HNSW needs ef ≈ 2.5 × k_each
+(ef=256) to get within 0.1 points of exact search, and ef = 5 × k_each (512) to
+match it exactly.
+
+### 5.2 What each index is good for
+
+* **HNSW** is the best latency/quality trade-off: at ef=256 it is **5× faster
+  than exact search** (0.63 ms vs 3.15 ms p50, p99 0.90 ms vs 3.72 ms) for −0.1
+  nDCG points, and lossless at ef=512 for 2.6× faster. It pays for this in
+  memory (+18 % over the raw vectors for the graph), a 19 s build that has no
+  training step but is 600× slower than Flat, and **inserts at 3.3k vectors/s**,
+  over 100× slower than IVF. It also cannot delete: a removed document stays in
+  the graph as a routing node and is filtered out with an `IDSelector`. 1,000
+  tombstones leaked **0** results and cost 12 % search time
+  (0.100 → 0.112 ms per query). The filter only grows, so a high-churn corpus
+  has to rebuild the graph periodically.
+* **IVF-Flat** handles updates best: adds at 414k vectors/s, physical deletes
+  with stable ids, and centroids trained on 90 % of the corpus still give
+  0.896 recall@10 after the last 10 % is streamed in, against 0.902 for a full
+  rebuild. Its recall/latency curve is below HNSW's at every point measured.
+* **IVF-PQ** is the memory option: **7.6 MB, 20× smaller** than the raw
+  vectors. Recall@10 plateaus at **0.65** however many lists are probed. That
+  ceiling comes from quantisation error (8 dimensions per byte), not from search
+  depth, so raising nprobe cannot remove it. Even so, the hybrid keeps
+  0.897 / 0.986 nDCG on keyword / title queries because BM25 fills in what the
+  compressed dense arm misses. It is the option for a corpus that does not fit
+  in RAM, normally paired with exact re-ranking of a short list.
+* **Flat** removes vectors by compacting the array, which renumbers every later
+  row. Its "delete" is cheap (13 ms per 1k) but breaks the doc-id → metadata
+  mapping unless ids are wrapped in an `IndexIDMap`. Passing explicit ids to
+  `ann_index.build(..., ids=...)` does that wrapping.
+
+### 5.3 What is served, and why it is still Flat
+
+At 100K documents, exact search costs **3.15 ms of single-core time** per query
+against 12.9 ms to encode the query (section 2.4).
+The best ANN index saves at most ~2.5 ms per query, gives up exactness and makes
+updates harder. That is not worth it at this corpus size, so Flat remains the
+default. HNSW is one environment variable away:
+
+```bash
+python build_ann_index.py --kind hnsw          # -> index/faiss_hnsw.bin (~20 s)
+VECTOR_INDEX=hnsw HNSW_EF_SEARCH=256 uvicorn main:app
+```
+
+The decision depends on corpus size. Flat cost is linear in N: extrapolating
+the measured 3.15 ms at 100K gives roughly 85 ms of CPU per query and 4.1 GB of
+vectors for the full 2.7M arXiv corpus. HNSW cost grows roughly logarithmically
+with N. At that scale the switch to HNSW (or IVF-PQ when memory binds) is
+required, and the efSearch rule from 5.1 carries over. These full-corpus
+figures are an **extrapolation, not a measurement**.
+
+## 6. What is not measured yet
+
+* **ANN behaviour at full-corpus scale.** Section 5 measures 100K vectors;
+  the 2.7M-document numbers in 5.3 are extrapolated. IVF-PQ with exact
+  re-ranking of a short list is the obvious next row.
 * **A larger cross-encoder**, and a GPU or quantised runtime that would change
   the section 3.2 verdict.
 * **Multi-positive judgements.** Every number here is single-positive known-item
   retrieval; a set with graded, multi-document judgements would be strictly
   better and is the main threat to these conclusions.
 
-## 6. Layout
+## 7. Layout
 
 ```
 backend/
@@ -243,6 +355,8 @@ backend/
   bm25_index.py     corpus-wide BM25 over a precomputed sparse weight matrix
   tokenizer.py      the two tokenisations compared
   search.py         the served hybrid retrieval path
+  ann_index.py      Flat / IVF / IVF-PQ / HNSW: build, tune, persist, update, delete
+  build_ann_index.py  builds index/faiss_<kind>.bin from the exact index
   eval/
     encoder.py      query encoder (transformers; matches the ingest embeddings exactly)
     retrievers.py   dense / BM25 / legacy hybrid / weighted fusion / RRF / cross-encoder
@@ -251,8 +365,10 @@ backend/
     build_queries.py builds the three query sets
     run_eval.py     stage-1 ablation: quality, latency, paired bootstrap
     run_rerank_eval.py stage-2 cross-encoder reranking and depth sweep
-    plot_ablation.py / plot_rerank.py  the two figures
+    run_ann_bench.py   vector index benchmark (section 5)
+    plot_ablation.py / plot_rerank.py / plot_ann.py  the figures
     test_eval.py    metric, BM25, fusion and rerank correctness tests (14)
+    test_ann.py     index layer: exactness, nprobe/ef monotonicity, adds, deletes (10)
     queries/        query sets (.tsv authored, .jsonl generated)
     results/        ablation.json, alpha_sweep.png
 ```

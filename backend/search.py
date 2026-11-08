@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import os
 
-import faiss
 import numpy as np
 import pandas as pd
+# torch and faiss in one process: see "macOS: two OpenMP runtimes" in README.md
 from sentence_transformers import SentenceTransformer
+import faiss
 
+import ann_index
 from bm25_index import SparseBM25
 from fusion import arms_that_found, minmax_normalise, weighted_fusion
 from tokenizer import standard_tokens
@@ -43,9 +45,17 @@ K_EACH = int(os.environ.get("CANDIDATES_PER_ARM", "100"))
 RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "0"))
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
+# Vector index type (eval/README.md section 5). "flat" is exact search; "hnsw"
+# / "ivf" / "ivfpq" load index/faiss_<kind>.bin built by build_ann_index.py.
+VECTOR_INDEX = os.environ.get("VECTOR_INDEX", "flat")
+HNSW_EF_SEARCH = int(os.environ.get("HNSW_EF_SEARCH", "256"))
+IVF_NPROBE = int(os.environ.get("IVF_NPROBE", "128"))
+
 print("Loading search artifacts…")
 _model = SentenceTransformer(MODEL_NAME)
-_index = faiss.read_index(os.path.join(INDEX_DIR, "faiss_index.bin"))
+_index = faiss.read_index(os.path.join(
+    INDEX_DIR, "faiss_index.bin" if VECTOR_INDEX == "flat" else f"faiss_{VECTOR_INDEX}.bin"))
+ann_index.set_search_params(_index, nprobe=IVF_NPROBE, ef_search=HNSW_EF_SEARCH)
 _meta = pd.read_parquet(os.path.join(INDEX_DIR, "metadata.parquet"))
 _bm25 = SparseBM25.load(os.path.join(INDEX_DIR, "bm25_standard"))
 _reranker = None
@@ -57,7 +67,7 @@ if RERANK_TOP_K > 0:
     _rerank_texts = (_meta.title + ". " + _meta.abstract).tolist()
 
 print(
-    f"Loaded {_index.ntotal:,} vectors, {len(_meta):,} metadata rows, "
+    f"Loaded {_index.ntotal:,} vectors ({VECTOR_INDEX}), {len(_meta):,} metadata rows, "
     f"BM25 vocab {len(_bm25.vocab):,} (alpha={ALPHA}, k_each={K_EACH}, "
     f"rerank_top_k={RERANK_TOP_K})"
 )

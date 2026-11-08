@@ -26,3 +26,6 @@ data/
 
 # cross-encoder score cache (regenerate with backend/eval/run_rerank_eval.py)
 backend/eval/results/ce_scores/
+
+# benchmark / load-test run logs
+backend/eval/results/.*

@@ -11,6 +11,7 @@ was a bug in the original architecture.
 
 ![fusion weight sweep](backend/eval/results/alpha_sweep.png)
 ![quality vs latency frontier](backend/eval/results/rerank_frontier.png)
+![ANN recall/latency frontier](backend/eval/results/ann_frontier.png)
 
 ## Headline results
 
@@ -28,7 +29,7 @@ Known-item retrieval over the 100K-paper index, nDCG@10 by query type
 \* Stage-2 rows are measured on 340 of the queries (the title set is
 subsampled); see [backend/eval/README.md](backend/eval/README.md) section 3.
 
-Four things the ablation established:
+What the measurements established:
 
 1. **Neither arm wins alone.** BM25 beats dense by 4.6 nDCG points on
    title-shaped queries and loses by 4.0 on short keyword queries. The ranking
@@ -48,6 +49,17 @@ Four things the ablation established:
    than 10 never helped: the first stage's Recall@10 is already 1.000, so
    candidates 11-100 contain nothing left to find, and the usual "rerank the
    top 50" default would have cost 5× the latency for a slightly worse result.
+
+5. **ANN indexes have to be tuned for recall@100, not recall@10.** Flat, IVF,
+   IVF-PQ and HNSW were benchmarked on the 100K vectors with the hybrid's
+   end-to-end nDCG measured for each one. HNSW (M=32, ef=256) is 5× faster than
+   exact search (0.63 ms vs 3.15 ms p50, single core) for −0.1 nDCG points.
+   IVF at nprobe=32 has recall@10 = 0.95 and still costs 3.7 points, because
+   fusion reads the dense arm's top 100 and IVF's recall@100 is only 0.90.
+   IVF-PQ fits the index in 7.6 MB (20× smaller), but its recall plateaus at
+   0.65. Exact search stays the default at this corpus size; the full
+   trade-off, including build, update and delete costs, is in
+   [backend/eval/README.md](backend/eval/README.md) section 5.
 
 BM25 was also rebuilt as a precomputed sparse weight matrix: the index went from
 a 140 MB pickle to 35 MB, and corpus-wide lexical retrieval costs 0.6 ms p50
@@ -70,6 +82,8 @@ query
 backend/
   main.py           FastAPI app: GET /search, GET /health
   search.py         the served retrieval path
+  ann_index.py      Flat / IVF / IVF-PQ / HNSW vector indexes: build, tune, update, delete
+  build_ann_index.py  builds an approximate index from the exact one
   fusion.py         score fusion — imported by both the API and the harness
   bm25_index.py     corpus-wide BM25 over a precomputed sparse weight matrix
   tokenizer.py      tokenisation shared by indexing and querying
@@ -112,6 +126,9 @@ code change:
 | `CANDIDATES_PER_ARM` | `100` | documents each arm contributes to the fusion |
 | `RERANK_TOP_K` | `0` | cross-encoder rerank depth; `0` disables stage 2, `10` is the measured optimum |
 | `RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | reranker, loaded only when `RERANK_TOP_K > 0` |
+| `VECTOR_INDEX` | `flat` | `flat` (exact), `hnsw`, `ivf` or `ivfpq`; build with `python build_ann_index.py --kind hnsw` |
+| `HNSW_EF_SEARCH` | `256` | HNSW beam width; 256 is within 0.1 nDCG of exact, 512 matches it |
+| `IVF_NPROBE` | `128` | IVF lists probed per query (of 1024) |
 | `MODEL_NAME` | `all-MiniLM-L6-v2` | sentence-transformers model |
 | `INDEX_DIR` | `backend/index` | where the artifacts live |
 
@@ -124,7 +141,8 @@ python build_index.py                                  # BM25 indexes -> ../inde
 python build_queries.py --metadata ../index/metadata.parquet
 python run_eval.py                                     # stage 1 -> results/ablation.json
 python run_rerank_eval.py                              # stage 2 -> results/rerank.json
-python -m pytest test_eval.py -q                       # 14 correctness tests
+python run_ann_bench.py                                # vector indexes -> results/ann_bench.json
+python -m pytest test_eval.py test_ann.py -q           # 24 correctness tests
 ```
 
 The harness scores BM25, dense, the original hybrid, weighted fusion across an
@@ -137,15 +155,29 @@ latency percentiles and paired-bootstrap significance throughout.
 * Evaluation is **single-positive known-item retrieval**: absolute scores are
   optimistic and are not comparable to BEIR numbers. Only the relative
   comparison between systems is claimed.
-* The dense index is `IndexFlatIP` — exact brute-force search. It is already
-  58 % of dense-arm latency at 100K documents and scales linearly, so it will
-  not survive the full 2.7M corpus (which is also 4.1 GB of float32 vectors);
-  the HNSW / IVF-PQ recall-latency trade-off is unmeasured.
+* The default dense index is still `IndexFlatIP` (exact). At 100K documents it
+  costs 3.15 ms per query on one core, which is less than query encoding. Its
+  cost is linear in N, so at the full 2.7M corpus (4.1 GB of float32 vectors)
+  HNSW or IVF-PQ is required. The ANN numbers are measured at 100K only; the
+  full-corpus figures are extrapolated.
 * The cross-encoder verdict is hardware-bound, not model-bound: at ~19 pairs/s
   on two CPU cores the second stage is too slow to leave on; on a GPU or with a
   quantised runtime the same gain would cost tens of milliseconds. Only
   `ms-marco-MiniLM-L-6-v2` was measured.
 * No metadata filtering (category, year) in the query path yet.
+
+## Troubleshooting
+
+**macOS: two OpenMP runtimes.** The `faiss-cpu` and `torch` wheels each bundle
+their own `libomp.dylib`. With faiss 1.16 / torch 2.15, a process that loads both
+(the search API, the ANN benchmark) can segfault silently in its first parallel
+region. Point faiss at torch's copy so only one runtime is loaded:
+
+```bash
+SP=$(python -c "import site; print(site.getsitepackages()[0])")
+mv $SP/faiss/.dylibs/libomp.dylib $SP/faiss/.dylibs/libomp.dylib.orig
+ln -s $SP/torch/lib/libomp.dylib $SP/faiss/.dylibs/libomp.dylib
+```
 
 ## API
 
