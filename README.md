@@ -12,6 +12,7 @@ was a bug in the original architecture.
 ![fusion weight sweep](backend/eval/results/alpha_sweep.png)
 ![quality vs latency frontier](backend/eval/results/rerank_frontier.png)
 ![ANN recall/latency frontier](backend/eval/results/ann_frontier.png)
+![concurrent load](backend/eval/results/load_test.png)
 
 ## Headline results
 
@@ -61,6 +62,17 @@ What the measurements established:
    trade-off, including build, update and delete costs, is in
    [backend/eval/README.md](backend/eval/README.md) section 5.
 
+6. **Under concurrent load, embedding is the bottleneck, and batching is the
+   fix.** Query encoding now runs in a separate embedding service with
+   dynamic micro-batching and an LRU cache. Every request reports embed / ANN /
+   BM25 / fusion time separately. Greedy micro-batching raises embedding
+   throughput 3.0× (532 vs 178 rps) and cuts p99 at 64 clients 3.6×. End to
+   end, HNSW gives 1.8× the throughput of exact search (238 vs 134 rps)
+   although it saves only 2.5 ms on an idle query, because exact search competes
+   with the model for the same cores. With repeat traffic the cache (85 % hit
+   rate) halves single-query latency to 6.3 ms. Details are in
+   [backend/eval/README.md](backend/eval/README.md) section 6.
+
 BM25 was also rebuilt as a precomputed sparse weight matrix: the index went from
 a 140 MB pickle to 35 MB, and corpus-wide lexical retrieval costs 0.6 ms p50
 against ~30 ms for the dense arm (12.9 ms query encoding + 17.5 ms exact FAISS
@@ -70,8 +82,8 @@ search) — so the second arm is effectively free.
 
 ```
 query
-  ├─► SentenceTransformer (all-MiniLM-L6-v2) ─► FAISS IndexFlatIP ─► top 100
-  └─► tokenizer ─────────────────────────────► SparseBM25         ─► top 100
+  ├─► embedding service (MiniLM, micro-batching + LRU cache) ─► FAISS Flat / HNSW ─► top 100
+  └─► tokenizer ──────────────────────────────────────────────► SparseBM25        ─► top 100
                                                        │
                        min-max normalise each arm, blend α·dense + (1-α)·bm25
                                                        │
@@ -80,7 +92,10 @@ query
 
 ```
 backend/
-  main.py           FastAPI app: GET /search, GET /health
+  main.py           FastAPI app: GET /search, GET /metrics, GET /health
+  embedding_service.py  standalone embedding API (POST /embed): batching, cache, metrics
+  serving/          micro-batcher, embedding cache, per-stage latency recorder, embedder clients
+  loadtest/         concurrent load test, ranking-parity check
   search.py         the served retrieval path
   ann_index.py      Flat / IVF / IVF-PQ / HNSW vector indexes: build, tune, update, delete
   build_ann_index.py  builds an approximate index from the exact one
@@ -111,7 +126,12 @@ pip install -r backend/requirements.txt
 
 cd backend
 python ingest.py                 # builds index/ (FAISS + BM25 + metadata); ~30 min for 100K
-uvicorn main:app --reload        # http://localhost:8000
+uvicorn main:app --reload        # http://localhost:8000  (in-process embedding model)
+
+# or: embedding in its own process, HNSW for concurrent load (eval/README.md 6.2)
+python build_ann_index.py --kind hnsw
+uvicorn embedding_service:app --port 8001
+EMBEDDING_URL=http://127.0.0.1:8001 VECTOR_INDEX=hnsw uvicorn main:app --port 8000
 
 # frontend
 cd frontend && npm install && npm run dev    # http://localhost:5173
@@ -129,6 +149,10 @@ code change:
 | `VECTOR_INDEX` | `flat` | `flat` (exact), `hnsw`, `ivf` or `ivfpq`; build with `python build_ann_index.py --kind hnsw` |
 | `HNSW_EF_SEARCH` | `256` | HNSW beam width; 256 is within 0.1 nDCG of exact, 512 matches it |
 | `IVF_NPROBE` | `128` | IVF lists probed per query (of 1024) |
+| `EMBEDDING_URL` | unset | use the embedding service at this URL; unset = in-process model |
+| `EMBED_CACHE_SIZE` | `10000` | LRU query-embedding cache entries (in-process or service); `0` disables |
+| `EMBED_BATCHING` / `EMBED_MAX_BATCH` / `EMBED_MAX_WAIT_MS` | `1` / `32` / `0` | embedding service micro-batching; wait 0 = greedy (measured best) |
+| `FAISS_THREADS` | `1` | FAISS threads per search; 1 avoids oversubscription under concurrent requests |
 | `MODEL_NAME` | `all-MiniLM-L6-v2` | sentence-transformers model |
 | `INDEX_DIR` | `backend/index` | where the artifacts live |
 
@@ -142,7 +166,8 @@ python build_queries.py --metadata ../index/metadata.parquet
 python run_eval.py                                     # stage 1 -> results/ablation.json
 python run_rerank_eval.py                              # stage 2 -> results/rerank.json
 python run_ann_bench.py                                # vector indexes -> results/ann_bench.json
-python -m pytest test_eval.py test_ann.py -q           # 24 correctness tests
+python -m pytest test_eval.py test_ann.py test_serving.py -q   # 35 tests
+cd .. && python loadtest/run_load.py                   # concurrent load -> eval/results/load_test.json
 ```
 
 The harness scores BM25, dense, the original hybrid, weighted fusion across an
@@ -198,8 +223,14 @@ GET /search?q=<query>&top_k=<1-50>
       "score": 1.0, "vector_score": 1.0, "bm25_score": 1.0,
       "retrieved_by": "both"
     }
-  ]
+  ],
+  "timings": {"embed_ms": 8.4, "ann_ms": 3.5, "bm25_ms": 1.0, "fusion_ms": 0.17,
+              "format_ms": 0.9, "total_ms": 14.1, "embed_cache_hit": 0.0}
 }
 ```
+
+The same per-stage timings go out as a `Server-Timing` header, and
+`GET /metrics` returns rolling P50/P95/P99 per stage plus the embedding cache
+hit rate.
 
 `retrieved_by` reports which arm surfaced the document (`both` / `dense` / `bm25`).

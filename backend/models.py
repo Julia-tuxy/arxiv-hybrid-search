@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List
+from typing import Dict, List, Optional
 
 
 class PaperResult(BaseModel):
@@ -19,3 +19,4 @@ class SearchResponse(BaseModel):
     query: str
     total_results: int
     results: List[PaperResult]
+    timings: Optional[Dict[str, float]] = None   # per-stage ms, see search.hybrid_search_timed

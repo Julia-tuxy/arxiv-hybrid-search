@@ -19,16 +19,16 @@ queries; lower it toward 0.2 for title-shaped, copy-pasted queries.
 from __future__ import annotations
 
 import os
+import time
 
 import numpy as np
 import pandas as pd
-# torch and faiss in one process: see "macOS: two OpenMP runtimes" in README.md
-from sentence_transformers import SentenceTransformer
 import faiss
 
 import ann_index
 from bm25_index import SparseBM25
 from fusion import arms_that_found, minmax_normalise, weighted_fusion
+from serving.latency import StageTimer
 from tokenizer import standard_tokens
 
 INDEX_DIR = os.environ.get(
@@ -51,8 +51,26 @@ VECTOR_INDEX = os.environ.get("VECTOR_INDEX", "flat")
 HNSW_EF_SEARCH = int(os.environ.get("HNSW_EF_SEARCH", "256"))
 IVF_NPROBE = int(os.environ.get("IVF_NPROBE", "128"))
 
+# Query embedding. With EMBEDDING_URL set, encoding happens in the separate
+# embedding service (embedding_service.py: micro-batching + cache) and this
+# process never loads torch; otherwise an in-process model with an LRU cache.
+EMBEDDING_URL = os.environ.get("EMBEDDING_URL")
+EMBED_CACHE_SIZE = int(os.environ.get("EMBED_CACHE_SIZE", "10000"))
+
+# One FAISS thread per search. The API serves concurrent requests from a thread
+# pool; letting every request fan out to all cores as well oversubscribes the
+# CPU, and 1 thread is what eval/README.md section 5 measured.
+FAISS_THREADS = int(os.environ.get("FAISS_THREADS", "1"))
+
 print("Loading search artifacts…")
-_model = SentenceTransformer(MODEL_NAME)
+if EMBEDDING_URL:
+    from serving.embedder import RemoteEmbedder
+    _embedder = RemoteEmbedder(EMBEDDING_URL)
+else:
+    # torch and faiss in one process: see "macOS: two OpenMP runtimes" in README.md
+    from serving.embedder import LocalEmbedder
+    _embedder = LocalEmbedder(MODEL_NAME, cache_size=EMBED_CACHE_SIZE)
+faiss.omp_set_num_threads(FAISS_THREADS)
 _index = faiss.read_index(os.path.join(
     INDEX_DIR, "faiss_index.bin" if VECTOR_INDEX == "flat" else f"faiss_{VECTOR_INDEX}.bin"))
 ann_index.set_search_params(_index, nprobe=IVF_NPROBE, ef_search=HNSW_EF_SEARCH)
@@ -68,17 +86,15 @@ if RERANK_TOP_K > 0:
 
 print(
     f"Loaded {_index.ntotal:,} vectors ({VECTOR_INDEX}), {len(_meta):,} metadata rows, "
+    f"embedder {_embedder.name}, "
     f"BM25 vocab {len(_bm25.vocab):,} (alpha={ALPHA}, k_each={K_EACH}, "
     f"rerank_top_k={RERANK_TOP_K})"
 )
 
 
-def _dense_arm(query: str, k: int) -> list[tuple[int, float]]:
-    vec = _model.encode(
-        [query], normalize_embeddings=True, convert_to_numpy=True
-    ).astype(np.float32)
-    scores, ids = _index.search(vec, min(k, _index.ntotal))
-    return list(zip(ids[0].tolist(), scores[0].tolist()))
+def _dense_arm(vec: np.ndarray, k: int) -> list[tuple[int, float]]:
+    scores, ids = _index.search(vec.reshape(1, -1), min(k, _index.ntotal))
+    return [(i, s) for i, s in zip(ids[0].tolist(), scores[0].tolist()) if i >= 0]
 
 
 def _sparse_arm(query: str, k: int) -> list[tuple[int, float]]:
@@ -89,47 +105,81 @@ def _sparse_arm(query: str, k: int) -> list[tuple[int, float]]:
     return [(int(i), float(s)) for i, s in zip(ids, scores)]
 
 
-def hybrid_search(
+def hybrid_search(query: str, top_k: int = 10, alpha: float | None = None,
+                  k_each: int | None = None, rerank_top_k: int | None = None) -> list[dict]:
+    return hybrid_search_timed(query, top_k, alpha, k_each, rerank_top_k)[0]
+
+
+def hybrid_search_timed(
     query: str,
     top_k: int = 10,
     alpha: float | None = None,
     k_each: int | None = None,
     rerank_top_k: int | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
+    """Search and report where the time went, per stage, in milliseconds.
+
+    embed_ms   query encoding (in-process, or a round trip to the embedding service)
+    ann_ms     vector index search only
+    bm25_ms    sparse arm (tokenise + score)
+    fusion_ms  normalisation + blending
+    rerank_ms  cross-encoder, when enabled
+    format_ms  metadata lookup and response rows
+    total_ms   all of the above
+    """
     alpha = ALPHA if alpha is None else alpha
     k_each = K_EACH if k_each is None else k_each
+    t = StageTimer()
+    t0 = time.perf_counter()
 
-    dense_hits = _dense_arm(query, k_each)
-    sparse_hits = _sparse_arm(query, k_each)
-    dense = minmax_normalise(dense_hits)
-    sparse = minmax_normalise(sparse_hits)
-    fused = weighted_fusion(dense_hits, sparse_hits, alpha)
+    with t.stage("embed_ms"):
+        vec, einfo = _embedder.embed(query)
+    with t.stage("ann_ms"):
+        dense_hits = _dense_arm(vec, k_each)
+    with t.stage("bm25_ms"):
+        sparse_hits = _sparse_arm(query, k_each)
+    with t.stage("fusion_ms"):
+        dense = minmax_normalise(dense_hits)
+        sparse = minmax_normalise(sparse_hits)
+        fused = weighted_fusion(dense_hits, sparse_hits, alpha)
 
     rerank_k = RERANK_TOP_K if rerank_top_k is None else rerank_top_k
     if rerank_k > 0 and _reranker is not None:
-        head = fused[:rerank_k]
-        ce = _reranker.predict([(query, _rerank_texts[doc]) for doc, *_ in head],
-                               show_progress_bar=False)
-        # keep the fused score for display; reorder by the cross-encoder, and
-        # leave the tail in first-stage order
-        head = [head[i] for i in np.argsort(-np.asarray(ce))]
-        fused = head + fused[rerank_k:]
+        with t.stage("rerank_ms"):
+            head = fused[:rerank_k]
+            ce = _reranker.predict([(query, _rerank_texts[doc]) for doc, *_ in head],
+                                   show_progress_bar=False)
+            # keep the fused score for display; reorder by the cross-encoder, and
+            # leave the tail in first-stage order
+            head = [head[i] for i in np.argsort(-np.asarray(ce))]
+            fused = head + fused[rerank_k:]
 
-    results = []
-    for doc, score, d, s in fused[:top_k]:
-        row = _meta.iloc[doc]
-        results.append(
-            {
-                "arxiv_id": str(row["arxiv_id"]),
-                "title": str(row["title"]),
-                "abstract_snippet": str(row["abstract"])[:300],
-                "authors": str(row["authors"]),
-                "year": str(row["year"]),
-                "categories": str(row["categories"]),
-                "score": float(score),
-                "vector_score": float(d),
-                "bm25_score": float(s),
-                "retrieved_by": arms_that_found(doc, dense, sparse),
-            }
-        )
-    return results
+    with t.stage("format_ms"):
+        results = []
+        for doc, score, d, s in fused[:top_k]:
+            row = _meta.iloc[doc]
+            results.append(
+                {
+                    "arxiv_id": str(row["arxiv_id"]),
+                    "title": str(row["title"]),
+                    "abstract_snippet": str(row["abstract"])[:300],
+                    "authors": str(row["authors"]),
+                    "year": str(row["year"]),
+                    "categories": str(row["categories"]),
+                    "score": float(score),
+                    "vector_score": float(d),
+                    "bm25_score": float(s),
+                    "retrieved_by": arms_that_found(doc, dense, sparse),
+                }
+            )
+    t.timings["total_ms"] = (time.perf_counter() - t0) * 1000
+    t.timings["embed_cache_hit"] = float(einfo.get("cache_hit", False))
+    for k in ("embed_server_ms", "embed_queue_ms", "embed_batch_size"):
+        if einfo.get(k) is not None:
+            t.timings[k] = float(einfo[k])
+    return results, t.timings
+
+
+def embedder_stats() -> dict:
+    cache = getattr(_embedder, "cache", None)
+    return {"embedder": _embedder.name, "cache": cache.stats() if cache else None}

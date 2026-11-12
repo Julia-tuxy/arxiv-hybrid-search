@@ -336,8 +336,134 @@ with N. At that scale the switch to HNSW (or IVF-PQ when memory binds) is
 required, and the efSearch rule from 5.1 carries over. These full-corpus
 figures are an **extrapolation, not a measurement**.
 
-## 6. What is not measured yet
+## 6. Serving under concurrent load
 
+Query embedding now runs in its own process, `embedding_service.py`
+(`POST /embed`), with dynamic micro-batching (`serving/batcher.py`) and an LRU
+embedding cache (`serving/cache.py`). The search API calls it when
+`EMBEDDING_URL` is set and otherwise falls back to an in-process model. Every
+search request records **per-stage timings**: `embed_ms`, `ann_ms`, `bm25_ms`,
+`fusion_ms`, `format_ms` and `total_ms`. They are returned in the response body,
+in a `Server-Timing` header, and as rolling P50/P95/P99 on `GET /metrics`.
+Embedding cost and index-search cost are therefore always reported as
+separate numbers, never folded into one end-to-end figure.
+
+The served ranking is unchanged. `loadtest/verify_parity.py` runs all 740
+queries through the production `hybrid_search()` and reproduces section 2
+exactly (0.9906 / 0.9461 / 0.9285), both in-process and through the HTTP
+embedding service. The service ships vectors as base64 float32, not decimal
+JSON, so the vectors are bit-identical.
+
+```bash
+python loadtest/run_load.py              # -> results/load_test.json   (~10 min)
+python loadtest/run_load.py --experiments search_e2e --vector-index hnsw --e2e-key search_e2e_hnsw
+python loadtest/plot_load.py             # -> results/load_test.png
+python -m pytest test_serving.py -q      # batcher, cache, latency recorder (11)
+```
+
+The load generator starts the services as separate processes and drives them
+over real HTTP with closed-loop clients. Each client sends its next request as
+soon as the previous one returns. Connections are opened in an untimed warm-up,
+and above 16 connections the clients are spread over several processes. The
+first version of the harness did not do this, and its c=64 results were wrong:
+one asyncio/httpx process with 64 connections saturated at ~100 req/s. In that
+run the client measured p50 430 ms while the server measured p50 12 ms, and the
+batcher saw a mean batch of only 1.4. Four client processes × 16 connections
+against the same server measured 489 req/s with a mean batch of 28. All hardware
+is one 8-core Apple M1, shared by client and servers, so read the ratios between
+rows rather than the absolute numbers.
+
+![load test](results/load_test.png)
+
+### 6.1 Micro-batching: 3× throughput, 3.6× lower tail latency
+
+Embedding service alone, cache off, 400-1,024 requests per level:
+
+| clients | no batching | 5 ms batch window | **greedy batching** | greedy mean batch |
+|---|---|---|---|---|
+| 1 | 94 rps · p99 16 ms | 61 rps · p99 26 ms | **110 rps · p99 12 ms** | 1.0 |
+| 4 | 178 rps · p99 29 ms | 200 rps · p99 25 ms | **232 rps · p99 21 ms** | 2.0 |
+| 16 | 141 rps · p99 137 ms | 358 rps · p99 74 ms | **437 rps · p99 71 ms** | 6.8 |
+| 32 | 124 rps · p99 409 ms | 426 rps · p99 95 ms | **532 rps · p99 93 ms** | 14.2 |
+| 64 | 131 rps · p99 698 ms | 473 rps · p99 186 ms | **472 rps · p99 195 ms** | 31.0 |
+
+* **Without batching, throughput falls once load rises.** It peaks at c=4
+  (178 rps) and then declines. Each concurrent request runs its own forward
+  pass, and every pass starts a full set of torch threads, so 16 concurrent
+  calls on 8 cores oversubscribe the CPU. Server-side inference time rises from
+  8 ms to 55-59 ms per query.
+* **Batching turns concurrency into larger batches instead.** A batch of 31
+  queries takes 64 ms of inference, about 2 ms per query against 8 ms run
+  alone. Peak throughput is 3.0× higher (532 vs 178 rps) and p99 at c=64 is
+  3.6× lower (195 vs 698 ms).
+* **A fixed wait window hurts at low load.** A lone request waits the full
+  5 ms for company that never comes, which cost 35 % of throughput at c=1
+  (61 vs 94 rps). Greedy batching sets no timer: the batch is whatever queued
+  up while the previous batch was running. It matches or beats the 5 ms
+  window at every level measured, so it is the default (`EMBED_MAX_WAIT_MS=0`).
+  At c=1 it carries no batching overhead (queue wait 0.02 ms).
+
+### 6.2 Where the end-to-end time goes
+
+Search API → embedding service (greedy batching, cache off), p50 per stage:
+
+| clients | index | throughput | client p50 / p99 | embed | ANN | BM25 | fusion | format | server total |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | Flat | 62 rps | 16.1 / 17.9 ms | 8.4 | **3.5** | 1.0 | 0.17 | 0.9 | 14.1 |
+| 1 | HNSW ef=256 | 67 rps | 14.4 / 25.2 ms | 9.1 | **1.0** | 1.0 | 0.16 | 0.9 | 12.3 |
+| 16 | Flat | 134 rps | 117 / 188 ms | 67.0 | **12.3** | 4.8 | 0.25 | 4.0 | 91.6 |
+| 16 | HNSW ef=256 | **238 rps** | **63 / 117 ms** | 33.1 | **2.3** | 5.3 | 0.19 | 4.0 | 47.0 |
+| 64 | Flat | 124 rps | 506 / 861 ms | 186.0 | 19.3 | 18.3 | 0.31 | 8.0 | 248 |
+| 64 | HNSW ef=256 | **238 rps** | **262 / 384 ms** | 78.3 | 5.1 | 19.1 | 0.23 | 14.8 | 123 |
+
+* **Embedding dominates.** It is 60-75 % of server time at every level. Its
+  cost under load is mostly CPU contention: at c=16 the embedding round trip
+  is 67 ms, against 35 ms when the service runs alone at the same
+  concurrency (6.1).
+* **Under load, ANN choice matters more than single-query latency suggests.**
+  On one idle query HNSW saves only 2.5 ms (3.5 → 1.0 ms). Under load it gives
+  **1.8× the throughput** (238 vs 134 rps) and halves p50 at c=16. Exact search
+  spends 3.5 ms of core time per query on the same 8 cores the model needs, so
+  every flat search slows the embedding forward passes too (embed 67 → 33 ms
+  at c=16). This revises section 5.3: Flat is the right default for a single
+  idle query at 100K documents, and **HNSW (ef=256) is the right choice for
+  concurrent serving**, for −0.1 nDCG points on keyword queries (or none at
+  ef=512).
+* **The gap between client and server total is time spent queueing before
+  the handler runs.** At c=64 that is 262 − 123 ≈ 140 ms for HNSW. It is the
+  API's worker thread pool plus the GIL: BM25 and response formatting are
+  partly pure Python and grow from 1 ms to 15-19 ms under contention. The next
+  step for this tier is multiple API worker processes, not a faster index.
+
+### 6.3 The embedding cache
+
+Query traffic repeats. With 3,000 requests drawn Zipf(s=1.1) from the 740
+queries (448 distinct), the cache hit rate is **84.8 %**. A hit skips the
+model entirely. End to end (HNSW, `--e2e-cache`):
+
+| clients | cache off | cache on (Zipf traffic) |
+|---|---|---|
+| 1 | 67 rps · p50 14.4 ms (embed 9.1) | **107 rps · p50 6.3 ms** (embed 1.1) |
+| 16 | 238 rps · p50 63 ms | **262 rps · p50 55 ms** |
+| 64 | 238 rps · p50 262 ms | **319 rps · p50 194 ms** |
+
+At low load the cache halves latency. At high load the gain is smaller (+34 %
+throughput) because the bottleneck moves: with the model off the critical path,
+what is left is the single API process (BM25 at 21 ms, queueing before the
+handler). On the standalone embedding service, an all-hit workload tops out at
+~330-510 rps with p95 near 100 ms. That ceiling is one uvicorn event loop's
+HTTP handling, not the model, so a cache alone cannot push a single service
+process past what batching already reaches.
+
+The cache key collapses whitespace and nothing else. Lowercasing would be a
+safe normalisation for this uncased model, but would silently change results
+for a cased one.
+
+## 7. What is not measured yet
+
+* **Multi-process API serving and a GPU embedding service.** Section 6 runs
+  one API process and one CPU embedding process on the same 8 cores; the
+  queueing it found is the reason to measure both next.
 * **ANN behaviour at full-corpus scale.** Section 5 measures 100K vectors;
   the 2.7M-document numbers in 5.3 are extrapolated. IVF-PQ with exact
   re-ranking of a short list is the obvious next row.
@@ -347,7 +473,7 @@ figures are an **extrapolation, not a measurement**.
   retrieval; a set with graded, multi-document judgements would be strictly
   better and is the main threat to these conclusions.
 
-## 7. Layout
+## 8. Layout
 
 ```
 backend/
@@ -357,6 +483,9 @@ backend/
   search.py         the served hybrid retrieval path
   ann_index.py      Flat / IVF / IVF-PQ / HNSW: build, tune, persist, update, delete
   build_ann_index.py  builds index/faiss_<kind>.bin from the exact index
+  embedding_service.py  standalone embedding API: micro-batching, cache, /metrics
+  serving/          batcher.py, cache.py, latency.py (per-stage recorder), embedder.py
+  loadtest/         run_load.py (concurrent load), plot_load.py, verify_parity.py
   eval/
     encoder.py      query encoder (transformers; matches the ingest embeddings exactly)
     retrievers.py   dense / BM25 / legacy hybrid / weighted fusion / RRF / cross-encoder
@@ -369,6 +498,7 @@ backend/
     plot_ablation.py / plot_rerank.py / plot_ann.py  the figures
     test_eval.py    metric, BM25, fusion and rerank correctness tests (14)
     test_ann.py     index layer: exactness, nprobe/ef monotonicity, adds, deletes (10)
+    test_serving.py micro-batcher, embedding cache, latency recorder (11)
     queries/        query sets (.tsv authored, .jsonl generated)
     results/        ablation.json, alpha_sweep.png
 ```
