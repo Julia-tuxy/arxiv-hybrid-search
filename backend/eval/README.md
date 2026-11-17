@@ -486,6 +486,7 @@ backend/
   embedding_service.py  standalone embedding API: micro-batching, cache, /metrics
   serving/          batcher.py, cache.py, latency.py (per-stage recorder), embedder.py
   loadtest/         run_load.py (concurrent load), plot_load.py, verify_parity.py
+  distributed/      sharded deployment; design and results in distributed/README.md
   eval/
     encoder.py      query encoder (transformers; matches the ingest embeddings exactly)
     retrievers.py   dense / BM25 / legacy hybrid / weighted fusion / RRF / cross-encoder
@@ -499,6 +500,7 @@ backend/
     test_eval.py    metric, BM25, fusion and rerank correctness tests (14)
     test_ann.py     index layer: exactness, nprobe/ef monotonicity, adds, deletes (10)
     test_serving.py micro-batcher, embedding cache, latency recorder (11)
+    test_distributed.py  sharding, exact merge, failover, breaker, version pinning (11)
     queries/        query sets (.tsv authored, .jsonl generated)
     results/        ablation.json, alpha_sweep.png
 ```

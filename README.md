@@ -73,6 +73,16 @@ What the measurements established:
    rate) halves single-query latency to 6.3 ms. Details are in
    [backend/eval/README.md](backend/eval/README.md) section 6.
 
+7. **Sharding without losing accuracy, and failing soft.** A 2-shard × 2-replica
+   deployment (hash-sharded by arXiv id, BM25 with global statistics, exact
+   top-k merge) returns the **identical top-10 for all 740 queries** as a
+   single node. With a replica SIGKILLed or hung mid-load there are 0 errors and
+   identical results. A half-open circuit breaker cut the hung-replica p99
+   from 1,049 to 95 ms. With a whole shard down, queries return marked partial
+   results at about half the nDCG instead of failing. Index versions roll out
+   blue/green under traffic with 0 mixed-version responses. Design and
+   measurements: [backend/distributed/README.md](backend/distributed/README.md).
+
 BM25 was also rebuilt as a precomputed sparse weight matrix: the index went from
 a 140 MB pickle to 35 MB, and corpus-wide lexical retrieval costs 0.6 ms p50
 against ~30 ms for the dense arm (12.9 ms query encoding + 17.5 ms exact FAISS
@@ -96,6 +106,7 @@ backend/
   embedding_service.py  standalone embedding API (POST /embed): batching, cache, metrics
   serving/          micro-batcher, embedding cache, per-stage latency recorder, embedder clients
   loadtest/         concurrent load test, ranking-parity check
+  distributed/      sharded deployment: shard servers, fan-out/merge gateway, failover, versioning
   search.py         the served retrieval path
   ann_index.py      Flat / IVF / IVF-PQ / HNSW vector indexes: build, tune, update, delete
   build_ann_index.py  builds an approximate index from the exact one
@@ -166,14 +177,30 @@ python build_queries.py --metadata ../index/metadata.parquet
 python run_eval.py                                     # stage 1 -> results/ablation.json
 python run_rerank_eval.py                              # stage 2 -> results/rerank.json
 python run_ann_bench.py                                # vector indexes -> results/ann_bench.json
-python -m pytest test_eval.py test_ann.py test_serving.py -q   # 35 tests
+python -m pytest test_eval.py test_ann.py test_serving.py test_distributed.py -q   # 46 tests
 cd .. && python loadtest/run_load.py                   # concurrent load -> eval/results/load_test.json
+python -m distributed.run_cluster_demo                 # 2 shards x 2 replicas -> eval/results/cluster.json
 ```
 
 The harness scores BM25, dense, the original hybrid, weighted fusion across an
 α sweep, and RRF on three query sets, then sweeps cross-encoder rerank depth
 over the winning first stage — reporting Recall@10/@100, MRR@10, nDCG@10,
 latency percentiles and paired-bootstrap significance throughout.
+
+## Sharded deployment
+
+```bash
+cd backend
+python -m distributed.build_shards --version v1 --shards 2       # -> index/shards/v1/
+uvicorn embedding_service:app --port 8001
+SHARD_ID=0 uvicorn distributed.shard_server:app --port 9100       # repeat per shard / replica
+SHARD_ID=1 uvicorn distributed.shard_server:app --port 9101
+EMBEDDING_URL=http://127.0.0.1:8001 uvicorn distributed.gateway:app --port 8100
+```
+
+The shard map lives in `distributed/cluster.example.json` (`CLUSTER_CONFIG`).
+`GET /cluster` shows each replica's breaker state, and
+`POST /admin/version` switches index versions once every shard has one.
 
 ## Known limitations
 
